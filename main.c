@@ -87,11 +87,12 @@
  * Support and FAQ: visit <a href="http://www.atmel.com/design-support/">Atmel Support</a>
  */
 
+#include "csc_app.h"
 #include "asf.h"
 #include "stdio_serial.h"
-#include "conf_uart_serial.h"
-#include "time_tick.h"
-#include "EqSource.h"
+//#include "time_tick.h"
+#include "pt\pt.h"
+
 
 #define DBG_LOG(string) (printf("%s\n\r", string))
 
@@ -99,16 +100,20 @@
 extern "C" {
 #endif
 
-
-
 /* Global Variables and structures */
 
-static struct usart_module cdc_uart_module;
 static struct tc_module tc_instance;
 struct dac_module dac_inst;
 
 /* Audio buffer size of this example */
-#define AUDIO_BUF_SIZE  1024
+#define AUDIO_BUF_SIZE  2132
+
+/* Variaveis de controle */
+bool pause = false; // play/pause
+bool done = false; // finished playing
+bool ready = false; // file is open and ready to be read
+bool bton = true; // activate/deactivate bt proto
+
 
 /* Standard WAV audio header */
 COMPILER_PACK_SET(1)
@@ -138,23 +143,21 @@ volatile bool current_data_buf = 0, audio_playback_done = false;
 uint32_t nb_audio_blocks, block_cnt, buf_cnt, i, j;
 unsigned int temp;
 
-//EQUALIZADOR
-volatile uint16_t *audio_data_ptrEQ;
-EQSTATE *eqs;
-
-
 /* Variable that selects the required audio file to play */
-char test_file_name[] = "0:testro.wav"; //testkl.wav // test_16kHz
+char audio_file_name[32] = "0:testkl.wav"; //testkl.wav // test_16kHz
 /* FAT FS variables */
 Ctrl_status status;
 FRESULT res;
 FATFS fs;
 FIL file_object;
-TCHAR testd[128];
 
 #define CLOCK_SOURCE GCLK_GENERATOR_0 // clock source for TC and DAC
 
-/* DAC */
+/* Func Prototypes*/
+static void tc_callback_timer_match(struct tc_module *const module_inst); // timer counter match callback func
+static void extint_callback(void); // extint callback func
+
+#pragma region INITIALIZATION
 
 /**
  * \brief Configures the DAC in event triggered mode.
@@ -191,104 +194,8 @@ static void configure_dac(struct dac_module *dac_module)
 	dac_enable(dac_module);
 }
 
-
-/* DAC END*/
-
-/**
- *  Configure UART console.
- */
-static void configure_console(void)
-{
-	struct usart_config usart_conf;
-
-	usart_get_config_defaults(&usart_conf);
-	usart_conf.mux_setting = CONF_STDIO_MUX_SETTING;
-	usart_conf.pinmux_pad0 = CONF_STDIO_PINMUX_PAD0;
-	usart_conf.pinmux_pad1 = CONF_STDIO_PINMUX_PAD1;
-	usart_conf.pinmux_pad2 = CONF_STDIO_PINMUX_PAD2;
-	usart_conf.pinmux_pad3 = CONF_STDIO_PINMUX_PAD3;
-	usart_conf.baudrate    = CONF_STDIO_BAUDRATE;
-
-	stdio_serial_init(&cdc_uart_module, CONF_STDIO_USART_MODULE, &usart_conf);
-	usart_enable(&cdc_uart_module);
-}
-
-/* Updates the board LED to the current button state. */
-static void update_led_state(void)
-{
-	bool pin_state = port_pin_get_input_level(BUTTON_0_PIN);
-	if (pin_state) {
-		port_pin_set_output_level(LED_0_PIN, LED_0_INACTIVE);
-	} else {
-		port_pin_set_output_level(LED_0_PIN, LED_0_ACTIVE);
-	}
-}
-
-/** Callback function for the EXTINT driver, called when an external interrupt
- *  detection occurs.
- */
-static void extint_callback(void)
-{
-	static bool dac_out_on = true;
 	
-	if(dac_out_on)
-	{
-			dac_out_on = false;
-			dac_chan_disable_output_buffer(&dac_inst, DAC_CHANNEL_0);
-	}
-	else
-	{
-		dac_out_on = true;
-		dac_chan_enable_output_buffer(&dac_inst, DAC_CHANNEL_0);
-	}
-}
-
-/** Configures and registers the External Interrupt callback function with the
- *  driver.
- */
-static void configure_eic_callback(void)
-{
-	extint_register_callback(extint_callback,
-			BUTTON_0_EIC_LINE,
-			EXTINT_CALLBACK_TYPE_DETECT);
-	extint_chan_enable_callback(BUTTON_0_EIC_LINE,
-			EXTINT_CALLBACK_TYPE_DETECT);
-}
-
-/** Configures the External Interrupt Controller to detect changes in the board
- *  button state.
- */
-static void configure_extint(void)
-{
-	struct extint_chan_conf eint_chan_conf;
-	extint_chan_get_config_defaults(&eint_chan_conf);
-
-	eint_chan_conf.gpio_pin           = BUTTON_0_EIC_PIN;
-	eint_chan_conf.gpio_pin_mux       = BUTTON_0_EIC_MUX;
-	eint_chan_conf.detection_criteria = EXTINT_DETECT_BOTH;
-	eint_chan_conf.filter_input_signal = true;
-	extint_chan_set_config(BUTTON_0_EIC_LINE, &eint_chan_conf);
-}
-
-
-/** TC Callback function. Used to process match channel 0 interrupt
- */
-static void tc_callback_timer_match(struct tc_module *const module_inst)
-{
-
-	audio_data_ptrEQ = (uint16_t)do_3band(eqs, *audio_data_ptr++);
-
-	dac_chan_write(&dac_inst, DAC_CHANNEL_0, *audio_data_ptrEQ++);
-	buf_cnt++;
-	if (buf_cnt == (AUDIO_BUF_SIZE/2))
-	{
-		buf_cnt = 0;
-		audio_playback_done = true;
-	}
-}
-
-/** Configures  TC function with the  driver.
- */
+/* Config and enable TC3 and callbacks*/
 static void configure_tc(void)
 {
 	struct tc_config config_tc;
@@ -308,19 +215,13 @@ static void configure_tc(void)
 	tc_enable(&tc_instance);
 	
 	tc_stop_counter(&tc_instance);
-}
-
-/** Registers TC callback function with the  driver.
- */
-static void configure_tc_callbacks(void)
-{
-	tc_register_callback(&tc_instance, tc_callback_timer_match, TC_CALLBACK_CC_CHANNEL0);
 	
+	/* Register and enable callback functions for compare event*/
+	tc_register_callback(&tc_instance, tc_callback_timer_match, TC_CALLBACK_CC_CHANNEL0);		
 	tc_enable_callback(&tc_instance, TC_CALLBACK_CC_CHANNEL0);
 }
 
-/* EVSYS*/
-/* Event System initialization */
+/* Config and enable Event System*/
 static void evsys_init(void)
 {
 	struct events_resource conf_event_resource;
@@ -337,20 +238,61 @@ static void evsys_init(void)
 	events_attach_user(&conf_event_resource, EVSYS_ID_USER_DAC_START);
 }
 
-/* EVSYS END*/
+/* Configures the External Interrupt Controller and callbacks */
+static void configure_extint(void)
+{
+	struct extint_chan_conf eint_chan_conf;
+	extint_chan_get_config_defaults(&eint_chan_conf);
 
+	eint_chan_conf.gpio_pin           = BUTTON_0_EIC_PIN;
+	eint_chan_conf.gpio_pin_mux       = BUTTON_0_EIC_MUX;
+	eint_chan_conf.detection_criteria = EXTINT_DETECT_BOTH;
+	eint_chan_conf.filter_input_signal = true;
+	extint_chan_set_config(BUTTON_0_EIC_LINE, &eint_chan_conf);
+	
+	/* Register and enable callbacks*/
+	extint_register_callback(extint_callback, BUTTON_0_EIC_LINE, EXTINT_CALLBACK_TYPE_DETECT);
+	extint_chan_enable_callback(BUTTON_0_EIC_LINE, EXTINT_CALLBACK_TYPE_DETECT);
+}
 
-/* Function to mount file system, open audio file and read
-   audio header */
+#pragma endregion
+
+/** Callback function for the EXTINT driver, called when an external interrupt
+ *  detection occurs.
+ */
+static void extint_callback(void)
+{	
+	bton = true;
+}
+
+/** TC Callback function. Used to process match channel 0 interrupt
+ */
+static void tc_callback_timer_match(struct tc_module *const module_inst)
+{
+	dac_chan_write(&dac_inst, DAC_CHANNEL_0, *audio_data_ptr++);
+	
+	buf_cnt++;
+	if (buf_cnt == (AUDIO_BUF_SIZE/2))
+	{
+		buf_cnt = 0;
+		audio_playback_done = true;
+	}
+	
+}
+
+/* Function to mount FAT file system */
 static void mount_file_system(void)
 {		
 	/* Wait card present and ready */
 	do {
 		status = sd_mmc_test_unit_ready(0);
-		if (CTRL_FAIL == status) {
+		
+		if (CTRL_FAIL == status) 
+		{
 			printf("Card install FAIL\n\r");
 			printf("Please unplug and re-plug the card.\n\r");
-			while (CTRL_NO_PRESENT != sd_mmc_check(0)) {
+			while (CTRL_NO_PRESENT != sd_mmc_check(0)) 
+			{
 			}
 		}
 	} while (CTRL_GOOD != status);
@@ -361,109 +303,49 @@ static void mount_file_system(void)
 	
 	res = f_mount(LUN_ID_SD_MMC_0_MEM, &fs);
 	
-	if (FR_INVALID_DRIVE == res) {
+	if (FR_INVALID_DRIVE == res) 
+	{
 		printf("[FAIL] res %d\r\n", res);
 		while(1);
 	}
+	
 	printf("[OK]\r\n");
+}
 
+/* Open WAV audio file and read header*/
+static void open_wav()
+{
 	/* Open the WAV file */
-	printf("Open a file (f_open)...\r\n");
-	test_file_name[0] = LUN_ID_SD_MMC_0_MEM + '0';
-	res = f_open(&file_object, (char const *)test_file_name, FA_READ);
-	if (res != FR_OK) {
+	printf("Open file \"%s\"\r\n", audio_file_name);
+	audio_file_name[0] = LUN_ID_SD_MMC_0_MEM + '0';
+	res = f_open(&file_object, (char const *)audio_file_name, FA_READ);
+	if (res != FR_OK)
+	{
 		printf("[FAIL] res %d\r\n", res);
 		while(1);
 	}
 	printf("[OK]\r\n");
 	
 	/* Read audio header */
-	printf("Read from file (f_read)...\r\n");
+	printf("Reading WAV\r\n");
 	res = f_read(&file_object, (uint8_t *)&audio_header, \
-					sizeof(audio_header), &temp);
-	if (res != FR_OK) {
+	sizeof(audio_header), &temp);
+	
+	if (res != FR_OK) 
+	{
 		printf("[FAIL] res %d\r\n", res);
 		while(1);
 	}
 	printf("[OK]\r\n");
+	
+	ready = true;
 }
 
-/**
- *  \brief getting-started Application entry point.
- *
- *  \return Unused (ANSI-C compatibility).
-*/
-int main(void)
+static void config_led()
 {
-	
-
-	init_3band_state(eqs, 10,10,20);
-
-	
-
-
 	struct port_config pin;
-
-	system_init();
-
-	/*Configure UART console.*/
-	configure_console();
 	
-	DBG_LOG("UART DONE");
-	
-	/*Configures  TC driver*/
-	DBG_LOG("Config TC");
-	configure_tc();
-	DBG_LOG("TC DONE");
-	
-	/*Configures TC callback*/
-	DBG_LOG("Config TC Callback");
-	configure_tc_callbacks();
-	DBG_LOG("TC Callback DONE");		
-
-	/*Configure and initialize DAC*/
-	DBG_LOG("Initializing DAC");
-	/* Enable the internal bandgap to use as reference to the DAC */
-	system_voltage_reference_enable(SYSTEM_VOLTAGE_REFERENCE_BANDGAP);
-	configure_dac(&dac_inst);
-	DBG_LOG("DAC DONE");
-
-	/*Configures the External Interrupt*/
-	DBG_LOG("Config EXTINT");
-	configure_extint();
-	DBG_LOG("EXTINT DONE");
-	
-	/*Configures the External Interrupt callback*/
-	DBG_LOG("Config EXTINT Callback");
-	configure_eic_callback();
-	DBG_LOG("EXTINT Callback DONE");	
-
-	/*Initialize the delay driver*/
-	DBG_LOG("Initialize Delay Driver");
-	delay_init();
-	DBG_LOG("Delay Driver DONE");
-	
-	/* Initialize event system*/
-	DBG_LOG("Initialize EVSYS");
-	evsys_init();
-	DBG_LOG("EVSYS DONE");
-
-	/*Enable system interrupt*/
-	DBG_LOG("Enabling Interrupts");
-	system_interrupt_enable_global();
-	DBG_LOG("Interrupt DONE");	
-	
-	/* Initialize SD MMC stack */
-	DBG_LOG("Initialize SD");
-	sd_mmc_init();
-	DBG_LOG("SD DONE");
-	
-	/*Initialize FAT file system and read .wav*/
-	DBG_LOG("Initializing FAT");
-	mount_file_system();
-	DBG_LOG("FAT DONE");
-	
-    /*Configures PORT for LED0*/
+	/*Configures PORT for LED0*/
 	port_get_config_defaults(&pin);
 	pin.direction = PORT_PIN_DIR_OUTPUT;
 	port_pin_set_config(LED0_PIN, &pin);
@@ -481,44 +363,183 @@ int main(void)
 	}
 
 	port_pin_set_output_level(LED0_PIN, LED0_INACTIVE);
+}
+
+void command(char *msg, char size)
+{	
+	if(strncmp(msg, "pause", size) == 0)
+	{
+		if(done) // can't pause something that isn't playing dummy!
+			return;
+		
+		if(pause)
+		{
+			pause = false;
+			dac_chan_enable_output_buffer(&dac_inst, DAC_CHANNEL_0);
+			tc_start_counter(&tc_instance);
+
+		}
+		else
+		{
+			pause = true;
+			dac_chan_disable_output_buffer(&dac_inst, DAC_CHANNEL_0);
+			tc_stop_counter(&tc_instance);
+		}
+		
+		return;
+	}
 	
-	dac_chan_enable_output_buffer(&dac_inst, DAC_CHANNEL_0);
+	if(strncmp(msg, "done", size) == 0)
+	{
+		done = true;
+		dac_chan_disable_output_buffer(&dac_inst, DAC_CHANNEL_0);
+		tc_stop_counter(&tc_instance);
+		
+		return;
+	}
+	
+	if(strncmp(msg, "play", 4) == 0)
+	{
+		msg[size] = '\0';
+		
+		sprintf(&audio_file_name[2], "%s", &msg[5]);
+		command("done", 4);
+		
+		return;
+	}
+	
+	if(strncmp(msg, "btoff", size) == 0)
+	{
+		bton = false;
+		return;
+	}
+}
+
+#pragma region PROTOTHREADS
+
+static struct pt pt1, pt2, pt3; // protothreads state variables
+
+/* Load samples from wav  */
+static PT_THREAD(PROTO_SAMPLES(struct pt *pt))
+{
+	PT_BEGIN(pt);
+
+	while(1)
+	{
+		if (current_data_buf == 0) 
+		{
+			/* Read audio data */
+			res = f_read(&file_object, (uint8_t *)temp_audio_buf, AUDIO_BUF_SIZE*2, &temp);
+			if (res != FR_OK) 
+			{
+				printf("[FAIL] Reading block %d\r\n", (int)i);
+				while(1);
+			}
+			
+			if(temp < AUDIO_BUF_SIZE*2)
+			{// EOF
+				command("done", 4); // finished playing
+			}
+			
+			/* Shift to form unsigned value */
+			j = 0;
+			for (i = 0; i < AUDIO_BUF_SIZE; i = i+2) {
+				temp = (uint16_t)((int32_t)temp_audio_buf[i] + 32768);
+				audio_data_1[j++] = (temp >> 6);
+			}
+			
+			/* Wait until it is sampled by DAC. It is set at timer call back
+			 * to indicate next set of data can be processed.
+			 */
+			PT_YIELD_UNTIL(pt, audio_playback_done);
+			audio_playback_done = false;
+			audio_data_ptr = audio_data_1;
+			current_data_buf = 1;
+		}
+		else 
+		{
+			/* Read audio data */
+			res = f_read(&file_object, (uint8_t *)temp_audio_buf, AUDIO_BUF_SIZE*2, &temp);
+			if (res != FR_OK) 
+			{
+				printf("[FAIL] Reading block %d\r\n", (int)i);
+				while(1);
+			}
+			
+			if(temp < AUDIO_BUF_SIZE*2)
+			{// EOF
+				command("done", 4); // finished playing
+			}
+			
+			/* Shift to form unsigned value */
+			j = 0;
+			for (i = 0; i < AUDIO_BUF_SIZE; i = i+2) 
+			{
+				temp = (uint16_t)((int32_t)temp_audio_buf[i] + 32768);
+				audio_data_0[j++] = (temp >> 6);
+			}
+			
+			/* Wait until it is sampled by DAC. It is set at timer call back
+			 * to indicate next set of data can be processed.
+			 */
+			PT_YIELD_UNTIL(pt, audio_playback_done);
+			
+			audio_playback_done = false;
+			/* Switch the pointer to next buffer */
+			audio_data_ptr = audio_data_0;
+			current_data_buf = 0;
+		}
+	}
+
+	PT_END(pt);
+}
+
+/* Process bluetooth events*/
+static PT_THREAD(PROTO_BT(struct pt *pt))
+{
+  PT_BEGIN(pt);
+
+  while(1)
+  {
+	ble_event_task();
+	
+	PT_YIELD(pt);	
+  }
+  
+  PT_END(pt);
+}
+
+
+/* Main music thread*/
+static PT_THREAD(PROTO_PLAYER(struct pt *pt))
+{
+  PT_BEGIN(pt);
+
+  /* We loop forever here. */
+  while(1) 
+  {
+	  do 
+	  {
+		  open_wav();
+	  }  while(!ready); // nothing to play
+	  
+	dac_chan_enable_output_buffer(&dac_inst, DAC_CHANNEL_0); // enable DAC output
 	
 	printf("FILE HEADER PRINT: \n\n\rChunkID: %s\n\rChunkSize: %d\n\rFormat: %s\n\rSubChunk1ID: %s\n\rSubchunk1Size: %d\n\rAudioFormat: %d\n\r",
 			audio_header.ChunkID, audio_header.ChunkSize, audio_header.Format, audio_header.Subchunk1ID, audio_header.Subchunk1Size, 
-			audio_header.AudioFormat);
-			
+			audio_header.AudioFormat);			
 	printf("NumChannels: %d\n\rSampleRate: %d\n\rByteRate: %d\n\rBlockAlign: %d\n\rBitsPerSample: %d\n\rSubchunk2ID: %s\n\rSubchunk2Size: %d\n\r",
 			audio_header.NumChannels, audio_header.SampleRate, audio_header.ByteRate, audio_header.BlockAlign, audio_header.BitsPerSample, 
 			audio_header.Subchunk2ID, audio_header.Subchunk2Size);
-	
-	
-	volatile int test = system_gclk_gen_get_hz(CLOCK_SOURCE);
-	
-	int cValue = (system_gclk_gen_get_hz(CLOCK_SOURCE)/audio_header.SampleRate);
-	
+			
 	/* Set timer 0 compare value corresponding to wav sample rate */
-	tc_set_compare_value(&tc_instance, 0, cValue);
-	
-	/* Set the timer top value to alter the overflow frequency */
-	//tc_set_top_value(&tc_instance, system_gclk_gen_get_hz(GCLK_GENERATOR_0) / audio_header.SampleRate);
-	
-	/* The input data is processed for block of AUDIO_BUF_SIZE.
-	 * Find number of AUDIO_BUF_SIZE data blocks in the input .WAV file. 
-	 * Subchunk2Size of the audio header tells the number of audio data in 
-	 * the input wave file. 
-	 * Note : As it is stereo data both left and right channel data is read. 
-	 * But only left channel data is processed. So when reading the audio 
-	 * samples the read size is set to twice the AUDIO_BUF_SIZE.
-	 */
-	nb_audio_blocks = audio_header.Subchunk2Size - \
-						(audio_header.Subchunk2Size % (AUDIO_BUF_SIZE*2));
-	nb_audio_blocks = nb_audio_blocks/(AUDIO_BUF_SIZE*2);
+	tc_set_compare_value(&tc_instance, 0, system_gclk_gen_get_hz(CLOCK_SOURCE)/audio_header.SampleRate);
 	
 	/* Read audio data from the input wav file in temp_audio_buf */
 	res = f_read(&file_object, (uint8_t *)temp_audio_buf, \
 					AUDIO_BUF_SIZE*2, &temp);
-	if (res != FR_OK) {
+	if (res != FR_OK) 
+	{
 		printf("[FAIL] Reading first block!\r\n");
 		while(1);
 	}
@@ -534,78 +555,113 @@ int main(void)
 		temp = (uint16_t)(temp2 & 0xFFFF);
 		audio_data_0[j++] = (temp >> 6);
 	}	
+	
 	/* Move the current data pointer to buffer1 */
 	audio_data_ptr = audio_data_0;
 	current_data_buf = 0;
+	
+	done = false; // not even started yet!
+	
 	/* Start timer to sample first block */
 	tc_start_counter(&tc_instance);
 	
-	/* Read data for nb_audio_blocks-1 times as it is once read before */
-	for (block_cnt = 0; block_cnt < nb_audio_blocks-1; block_cnt++)	
-	{
-		/* Check if the pointer is in buffer1 or 2 via current_data_buf value 
-		 * and switch the buffer accordingly. 
-		 */
-		if (current_data_buf == 0) 
-		{
-			/* Read audio data */
-			res = f_read(&file_object, (uint8_t *)temp_audio_buf, AUDIO_BUF_SIZE*2, &temp);
-			if (res != FR_OK)
-			{
-				printf("[FAIL] Reading block %d\r\n", (int)i);
-				while(1);
-			}
+	/* While not done, play*/
+	do
+	{		
+		PROTO_SAMPLES(&pt2);	
+		
+		if(bton)	
+			PROTO_BT(&pt3);		
 			
-			/* Shift to form unsigned value */
-			j = 0;
-			for (i = 0; i < AUDIO_BUF_SIZE; i = i+2) 
-			{
-				temp = (uint16_t)((int32_t)temp_audio_buf[i] + 32768);
-				audio_data_1[j++] = (temp >> 6);
-			}
-			
-			/* Wait until it is sampled by DAC. It is set at timer call back
-			 * to indicate next set of data can be processed.
-			 */
-			while(!audio_playback_done);
-			audio_playback_done = false;
-			audio_data_ptr = audio_data_1;
-			current_data_buf = 1;
-		}
-		else {
-			/* Read audio data */
-			res = f_read(&file_object, (uint8_t *)temp_audio_buf, AUDIO_BUF_SIZE*2, &temp);
-			if (res != FR_OK) {
-				printf("[FAIL] Reading block %d\r\n", (int)i);
-				while(1);
-			}
-			/* Shift to form unsigned value */
-			j = 0;
-			for (i = 0; i < AUDIO_BUF_SIZE; i = i+2) {
-				temp = (uint16_t)((int32_t)temp_audio_buf[i] + 32768);
-				audio_data_0[j++] = (temp >> 6);
-			}
-			/* Wait until it is sampled by DAC. It is set at timer call back
-			 * to indicate next set of data can be processed.
-			 */
-			while(!audio_playback_done);
-			audio_playback_done = false;
-			/* Switch the pointer to next buffer */
-			audio_data_ptr = audio_data_0;
-			current_data_buf = 0;
-		}
-	}
+	} while(!done);
+	
 	/* Stop the timer once processing all input audio data */
 	tc_stop_counter(&tc_instance);
 	/* Close the file */
 	f_close(&file_object);
 	printf("Audio playback done! Closing File.\r\n");
+  }
+
+  PT_END(pt);
+}
+
+#pragma endregion
+
+
+/**
+ *  \brief getting-started Application entry point.
+ *
+ *  \return Unused (ANSI-C compatibility).
+*/
+int main(void)
+{
+	system_init();
+
+	/* Initialize serial console */
+	sio2host_init();		
 	
-	/* Loop until next reset */
+	printf("\033[2J"); //"clear" terminal
+	DBG_LOG("UART DONE");
 	
-	/*main loop*/
+	/*Configures TC driver and callbacks*/
+	DBG_LOG("Config TC");
+	configure_tc();
+	DBG_LOG("TC DONE");		
+
+	/*Configure and initialize DAC*/
+	DBG_LOG("Initializing DAC");
+	/* Enable the internal bandgap to use as reference to the DAC */
+	system_voltage_reference_enable(SYSTEM_VOLTAGE_REFERENCE_BANDGAP);
+	configure_dac(&dac_inst);
+	DBG_LOG("DAC DONE");
+
+	/*Initialize the delay driver*/
+	DBG_LOG("Initialize Delay Driver");
+	delay_init();
+	DBG_LOG("Delay Driver DONE");
+	
+	/* Initialize event system*/
+	DBG_LOG("Initialize EVSYS");
+	evsys_init();
+	DBG_LOG("EVSYS DONE");
+	
+	/*Configures the External Interrupt and callbacks*/
+	DBG_LOG("Config EXTINT");
+	configure_extint();
+	DBG_LOG("EXTINT DONE");	
+
+	/*Enable system interrupt*/
+	DBG_LOG("Enabling Interrupts");
+	system_interrupt_enable_global();
+	DBG_LOG("Interrupt DONE");	
+	
+	/* Initialize SD MMC stack */
+	DBG_LOG("Initialize SD");
+	sd_mmc_init();
+	DBG_LOG("SD DONE");
+	
+	/*Initialize FAT file system and read .wav*/
+	DBG_LOG("Initializing FAT");
+	mount_file_system();
+	DBG_LOG("FAT DONE");
+	
+	/*Initialize BLE*/
+	DBG_LOG("Initializing BLUETOOTH");
+	BTSTART();
+	DBG_LOG("\n\rBLUETOOTH DONE");
+	
+	/* Initialize the protothread state variables with PT_INIT(). */
+	PT_INIT(&pt1);
+	PT_INIT(&pt2);
+	PT_INIT(&pt3);
+	
+	/* Sinalize system init DONE*/
+	config_led();
+	
+	/* Protothreads take it from here*/
 	while(1)
 	{
+		PROTO_PLAYER(&pt1); // music
 	}
 }
 

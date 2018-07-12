@@ -44,6 +44,8 @@
 #ifndef ASF_H
 #define ASF_H
 
+void command(char *msg, char size);
+
 /*
  * This file includes all API header files for the selected drivers from ASF.
  * Note: There might be duplicate includes required by more than one driver.
